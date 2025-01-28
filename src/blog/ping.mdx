@@ -1,0 +1,531 @@
+---
+layout: blog.njk
+title: screwing up ping with eBPF/XDP
+date: 2025-02-02
+tags:
+  - post
+description: |
+  abusing ping implementation details to make it look cursed
+---
+
+*(this might be a very common piece of knowledge, but i am not really experienced with such stuff. i've tried to learn something about eBPF programming and randomly found this out)*
+
+<div className="h-2"></div>
+
+**tl;dr:** it is quite easy to abuse dubious time calculation logic in ping to achieve this result:
+```bash
+$ ping pingme.x3lfy.space
+PING pingme.x3lfy.space (91.239.23.176) 56(84) bytes of data.
+64 bytes from 91.239.23.176: icmp_seq=1 ttl=206 time=3200828 ms
+64 bytes from 91.239.23.176: icmp_seq=2 ttl=184 time=3719749 ms
+64 bytes from 91.239.23.176: icmp_seq=3 ttl=87 time=1705390 ms
+64 bytes from 91.239.23.176: icmp_seq=4 ttl=190 time=952669 ms
+64 bytes from 91.239.23.176: icmp_seq=5 ttl=52 time=1225036 ms
+64 bytes from 91.239.23.176: icmp_seq=6 ttl=192 time=3620882 ms
+64 bytes from 91.239.23.176: icmp_seq=7 ttl=167 time=2060680 ms
+64 bytes from 91.239.23.176: icmp_seq=8 ttl=163 time=406768 ms
+```
+
+***my code only tricks iputils ping implementation. but i think it is technically possible to achieve the same result for busybox. Windows ping is insensitive to this problem, because it calculates time differently***
+
+<div className="py-0.5"></div>
+
+## how ping works?
+
+ping sends a so-called ICMP *Echo Request*, which consists of an IP header with protocol number 1 (stands for ICMP protocol), ICMP header and some payload.
+here is the ICMP header schema:
+```
++--------+--------+--------+--------+
+|   0    |   1    |   2    |   3    |
+|01234567|01234567|01234567|01234567|
++--------+--------+--------+--------+
+|  Type  |  Code  |    Checksum     |
++--------+--------+--------+--------+
+|   Identifier    | Sequence number |
++--------+--------+--------+--------+
+|              Payload...           |
+```
+pinging host sets the fields like so:
+- <Mono>Type</Mono> to 8, and <Mono>Code</Mono> to 0 - to mark this packet as an echo request
+- <Mono>Identifier</Mono> is just some number used to distinguish ICMP packets from different ping processes(usually set to PID or something like this) <br/>
+- <Mono>Sequence Number</Mono> is an incrementing number seen in <Mono>icmp_seq</Mono> field in ping output <br/>
+
+<div className="py-0.5"></div>
+
+target host recieves this packet and its os kernel processes it:
+- sets the <Mono>Type</Mono> to 0 (to mark this packet as an *Echo Reply*)
+- recalculates checksum
+- sends the revamped packet to the pinging host
+
+<div className="py-0.5"></div>
+
+## how ping calculates time?
+
+if you've ever inspected some traffic using wireshark, you might have noticed a strange field in ping requests:
+
+![wireshark](/pictures/ping/wireshark.png)
+
+"*Timestamp from icmp data*"...  why is there a timestamp in the echo request?
+
+<div className="py-0.5"></div>
+
+looking into [source code of iputils-ping](https://github.com/iputils/iputils/blob/master/ping/ping.c#L1594) (the most common ping implementation) explains why timestamp is there:
+```c
+icp = (struct icmphdr *)packet;
+icp->type = ICMP_ECHO;
+icp->code = 0;
+icp->checksum = 0;
+icp->un.echo.sequence = htons(rts->ntransmitted + 1);
+icp->un.echo.id = rts->ident;
+
+rcvd_clear(rts, rts->ntransmitted + 1);
+
+if (rts->timing) {
+    if (rts->opt_latency) {
+        struct timeval tmp_tv;
+        gettimeofday(&tmp_tv, NULL);
+        memcpy(icp + 1, &tmp_tv, sizeof(tmp_tv)); // hear!
+    } else {
+        memset(icp + 1, 0, sizeof(struct timeval));
+    }
+}
+```
+ping writes current timestamp right after ICMP header in packet. but for what reason?
+
+actually, when ping receives echo reply, it calculates trip time using this timestamp:
+```c
+uint8_t *ptr = icmph + icmplen; // icmph is a pointer to ICMP header
+
+++rts->nreceived;
+if (!csfailed)
+    acknowledge(rts, seq);
+
+if (rts->timing && cc >= (int)(8 + sizeof(struct timeval))) {
+    struct timeval tmp_tv;
+    memcpy(&tmp_tv, ptr, sizeof(tmp_tv)); // reading timestamp from packet
+
+restamp:
+    tvsub(tv, &tmp_tv); // tv is current (receive moment) timestamp (defined somewhere above)
+    triptime = tv->tv_sec * 1000000 + tv->tv_usec;
+```
+
+so ping essentially just subtracts timestamp of when reply was received from timestamp written into packet when it was sent to calculate trip time!
+
+<div className="py-0.5"></div>
+
+## abusing it
+what if our server modifies timestamp in echo request? we can subtract some number from it, so ping will think that packet was sent reeeeeally long time ago.
+very simple concept, but how to implement it? ICMP packets are processed inside the kernel and it's not possible to alter this process from the userspace. also, i don't have enough skills to modify kernel
+
+and here comes eBPF! there are a lot of words spoken about it, but in short, that is a technology in the linux kernel which allows to inject some code into kernel space and run it on some events.
+XDP subsystem allows to run eBPF programs right after network packet data was read from network adapter (even before those packets were parsed into internal kernel structures)
+
+besides eBPF program, we need some userspace tool to load program into the kernel and attach it to some interface.
+i used [ebpf-go](https://ebpf-go.dev/) library for this
+
+### writing ping responder in eBPF
+let's check that packet that program processes is actually an IP packet with ICMP inside and this ICMP message is an Echo Request, otherwise just pass it:
+```c
+void *data_end = (void*)(long)ctx->data_end;
+void *data     = (void*)(long)ctx->data;
+
+struct ethhdr *eth = data;
+if ((void *)(eth + 1) > data_end) { // check if Ethernet header actually exists
+    return XDP_PASS;
+}
+
+// ntohs is needed, because packet's endianness can differ from host's endianness
+if (bpf_ntohs(eth->h_proto) != ETH_P_IP) { // ETH_P_IP a constant for IP protocol
+    return XDP_PASS;
+}
+
+struct iphdr *iph = (void*)(eth + 1);
+if ((void*)(iph + 1) > data_end) { // check if IP header exists
+    return XDP_PASS;
+}
+
+if (iph->protocol != IPPROTO_ICMP) { // check if protocol is ICMP
+    return XDP_PASS;
+}
+
+struct icmphdr* icmphdr = (void*)(iph + 1); // check if ping header exists
+if ((void*)(icmphdr + 1) > data_end) {
+    return XDP_PASS;
+}
+
+if (icmphdr->type != 8) { // check if this an Echo Request
+    return XDP_PASS;
+}
+```
+
+now we need to:
+1) swap src and dst MAC addresses in Ethernet header;
+2) swap src and dst IP addresses in IP header;
+3) change type of ICMP packet
+
+good news - swapping some bytes doesn't require a recalculation of checksum, so p. 1 and 2 are quite easy to implement \
+bad news - p. 3 breaks ICMP checksum and we need to recalculate it
+
+i haven't found any better way to do this in XDP other than what is done in [this project](https://github.com/AirVantage/sbulb/blob/master/sbulb/bpf/checksum.c#L21)
+(thanks to [@sbernard31](https://github.com/sbernard31) for this code and helpful reply in [this thread](https://github.com/iovisor/bcc/issues/2463#issuecomment-512812898)).
+it allows to incrementally recalculate checksum using method described in [RFC 1624](https://tools.ietf.org/html/rfc1624)
+
+despite the fact that in the original project this function is used only to fix checksum for replaced IP addresses, it actually can fix checksum for any replaced byte.\
+here it is (and also little helpers for ICMP and IP):
+```c
+__attribute__((__always_inline__)) static inline __u16 csum_fold_helper(
+    __u64 csum) {
+  int i;
+#pragma unroll
+  for (i = 0; i < 4; i++) {
+    if (csum >> 16)
+      csum = (csum & 0xffff) + (csum >> 16);
+  }
+  return ~csum;
+}
+
+// https://github.com/AirVantage/sbulb/blob/master/sbulb/bpf/checksum.c#L21
+__attribute__((__always_inline__))
+static inline void update_csum(__u64 *csum, __be32 old_addr,__be32 new_addr ) {
+    *csum = ~*csum;
+    *csum = *csum & 0xffff;
+    __u32 tmp;
+    tmp = ~old_addr;
+    *csum += tmp;
+    *csum += new_addr;
+    *csum = csum_fold_helper(*csum);
+}
+
+__attribute__((__always_inline__))
+static inline void recalc_icmp_csum(struct icmphdr* hdr, __be32 old_value, __be32 new_value) {
+    __u64 csum = hdr->checksum;
+    update_csum(&csum, old_value, new_value);
+    hdr->checksum = csum;
+}
+
+__attribute__((__always_inline__))
+static inline void recalc_ip_csum(struct iphdr* hdr, __be32 old_value, __be32 new_value) {
+    __u64 csum = hdr->check;
+    update_csum(&csum, old_value, new_value);
+    hdr->check = csum;
+}
+```
+
+and now swap addresses and change packet type:
+```c
+// swap MAC addresses
+__u8 tmp_mac[ETH_ALEN]; // ETH_ALEN is number of octets in MAC address from linux/if_ether.h
+bpf_memcpy(tmp_mac, eth->h_dest, ETH_ALEN);
+bpf_memcpy(eth->h_dest, eth->h_source, ETH_ALEN);
+bpf_memcpy(eth->h_source, tmp_mac, ETH_ALEN);
+
+// swap IP addresses
+__u32 tmp_ip = iph->daddr;
+iph->daddr = iph->saddr;
+iph->saddr = tmp_ip;
+
+icmphdr->type = 0; // change ICMP type to Echo Reply
+recalc_icmp_csum(icmphdr, 8, icmphdr->type);
+```
+
+finally, send packet back:
+```c
+return XDP_TX;
+```
+
+<div className="py-0.5"></div>
+
+<details>
+<summary>final code</summary>
+```c
+#include <linux/if_ether.h>
+#include <linux/ip.h>
+#include <linux/bpf.h>
+#include <linux/icmp.h>
+#include <bpf/bpf_helpers.h>
+#include <linux/in.h>
+#include <bpf/bpf_endian.h>
+
+#define bpf_memcpy __builtin_memcpy
+
+__attribute__((__always_inline__)) static inline __u16 csum_fold_helper(
+    __u64 csum) {
+  int i;
+#pragma unroll
+  for (i = 0; i < 4; i++) {
+    if (csum >> 16)
+      csum = (csum & 0xffff) + (csum >> 16);
+  }
+  return ~csum;
+}
+
+__attribute__((__always_inline__))
+static inline void update_csum(__u64 *csum, __be32 old_addr,__be32 new_addr ) {
+    // ~HC
+    *csum = ~*csum;
+    *csum = *csum & 0xffff;
+    // + ~m
+    __u32 tmp;
+    tmp = ~old_addr;
+    *csum += tmp;
+    // + m
+    *csum += new_addr;
+    // then fold and complement result !
+    *csum = csum_fold_helper(*csum);
+}
+
+__attribute__((__always_inline__))
+static inline void recalc_icmp_csum(struct icmphdr* hdr, __be32 old_value, __be32 new_value) {
+    __u64 csum = hdr->checksum;
+    update_csum(&csum, old_value, new_value);
+    hdr->checksum = csum;
+}
+
+__attribute__((__always_inline__))
+static inline void recalc_ip_csum(struct iphdr* hdr, __be32 old_value, __be32 new_value) {
+    __u64 csum = hdr->check;
+    update_csum(&csum, old_value, new_value);
+    hdr->check = csum;
+}
+
+SEC("xdp")
+int pinger(struct xdp_md* ctx) {
+    void *data_end = (void *)(long)ctx->data_end;
+    void *data     = (void *)(long)ctx->data;
+
+    struct ethhdr *eth = data;
+    if ((void *)(eth + 1) > data_end) {
+        return XDP_PASS;
+    }
+
+    if (bpf_ntohs(eth->h_proto) != ETH_P_IP) {
+        return XDP_PASS;
+    }
+
+    struct iphdr *iph = (void*)(eth + 1);
+    if ((void*)(iph + 1) > data_end) {
+        return XDP_PASS;
+    }
+
+    if (iph->protocol != IPPROTO_ICMP) {
+        return XDP_PASS;
+    }
+
+    struct icmphdr* icmphdr = (void*)(iph + 1);
+    if ((void*)(icmphdr + 1) > data_end) {
+        return XDP_PASS;
+    }
+
+    if (icmphdr->type != 8) {
+        return XDP_PASS;
+    }
+
+    __u8 tmp_mac[ETH_ALEN];
+    bpf_memcpy(tmp_mac, eth->h_dest, ETH_ALEN);
+    bpf_memcpy(eth->h_dest, eth->h_source, ETH_ALEN);
+    bpf_memcpy(eth->h_source, tmp_mac, ETH_ALEN);
+
+    __u32 tmp_ip = iph->daddr;
+    iph->daddr = iph->saddr;
+    iph->saddr = tmp_ip;
+
+    icmphdr->type = 0;
+    recalc_icmp_csum(icmphdr, 8, icmphdr->type);
+
+    return XDP_TX;
+}
+
+char LICENSE[] SEC("license") = "GPL";
+```
+</details>
+
+<div className="py-0.5"></div>
+
+now, if you load and attach this program, interface will respond to pings as usual.
+but you won't be able to see any ICMP echo packets in wireshark, because they are processed before kernel can capture them
+
+<div className="py-0.5"></div>
+
+### screwing it up!
+
+***unfortunetely, this won't work for busybox ping (because it uses a bit different format of timestamp, [source](https://github.com/mirror/busybox/blob/master/networking/ping.c#L576)) and windows ping (it doesn't save timestamp in packet at all)***
+
+according to wireshark and iputils code, timestamp is located right after ICMP header, here are pointers to parts of this timestamp
+(<Mono>ts_secs</Mono> is the number of whole seconds since the epoch, <Mono>ts_nsecs</Mono> is nanosecond of second; see [struct timespec](https://en.cppreference.com/w/c/chrono/timespec)):
+```c
+__u64* ts_secs = icmphdr + 1;
+__u64* ts_nsecs = (void*)(icmphdr + 1) + sizeof(__u64);
+```
+
+check if packet actually contains timestamp, save old values for checksum recalculations and subtract some random values from timestamp:
+```c
+if ((void*)ts_nsecs + sizeof(__u64) <= data_end) {
+    __u64 old_secs = *ts_secs;
+    __u64 old_nsecs = *ts_nsecs;
+
+    *ts_secs -= bpf_get_prandom_u32() % 500;
+    *ts_nsecs -= bpf_get_prandom_u32();
+
+    recalc_icmp_csum(icmphdr, old_secs, *ts_secs);
+    recalc_icmp_csum(icmphdr, old_nsecs, *ts_nsecs);
+}
+```
+
+also, we can randomize TTL and ICMP sequence number:
+```c
+__u8 old_ttl = iph->ttl;
+iph->ttl = bpf_get_prandom_u32() % 200 + 40;
+recalc_ip_csum(iph, old_ttl, iph->ttl);
+
+__be16 old_seq = icmphdr->un.echo.sequence;
+icmphdr->un.echo.sequence = bpf_htons(bpf_get_prandom_u32() % 1000);
+recalc_icmp_csum(icmphdr, old_seq, icmphdr->un.echo.sequence);
+```
+*at least in my region, ICMP replies with random sequence number are somehow banned, so sequence numbers are not randomed in responses from pingme.x3lfy.space*
+
+<br />
+
+<details>
+<summary>final code</summary>
+```c
+#include <linux/if_ether.h>
+#include <linux/ip.h>
+#include <linux/bpf.h>
+#include <linux/icmp.h>
+#include <bpf/bpf_helpers.h>
+#include <linux/in.h>
+#include <bpf/bpf_endian.h>
+
+#define bpf_memcpy __builtin_memcpy
+
+__attribute__((__always_inline__)) static inline __u16 csum_fold_helper(
+    __u64 csum) {
+  int i;
+#pragma unroll
+  for (i = 0; i < 4; i++) {
+    if (csum >> 16)
+      csum = (csum & 0xffff) + (csum >> 16);
+  }
+  return ~csum;
+}
+
+__attribute__((__always_inline__))
+static inline void update_csum(__u64 *csum, __be32 old_addr,__be32 new_addr ) {
+    // ~HC
+    *csum = ~*csum;
+    *csum = *csum & 0xffff;
+    // + ~m
+    __u32 tmp;
+    tmp = ~old_addr;
+    *csum += tmp;
+    // + m
+    *csum += new_addr;
+    // then fold and complement result !
+    *csum = csum_fold_helper(*csum);
+}
+
+__attribute__((__always_inline__))
+static inline void recalc_icmp_csum(struct icmphdr* hdr, __be32 old_value, __be32 new_value) {
+    __u64 csum = hdr->checksum;
+    update_csum(&csum, old_value, new_value);
+    hdr->checksum = csum;
+}
+
+__attribute__((__always_inline__))
+static inline void recalc_ip_csum(struct iphdr* hdr, __be32 old_value, __be32 new_value) {
+    __u64 csum = hdr->check;
+    update_csum(&csum, old_value, new_value);
+    hdr->check = csum;
+}
+
+SEC("xdp")
+int pinger(struct xdp_md* ctx) {
+    void *data_end = (void *)(long)ctx->data_end;
+    void *data     = (void *)(long)ctx->data;
+
+    struct ethhdr *eth = data;
+    if ((void *)(eth + 1) > data_end) {
+        return XDP_PASS;
+    }
+
+    if (bpf_ntohs(eth->h_proto) != ETH_P_IP) {
+        return XDP_PASS;
+    }
+
+    struct iphdr *iph = (void*)(eth + 1);
+    if ((void*)(iph + 1) > data_end) {
+        return XDP_PASS;
+    }
+
+    if (iph->protocol != IPPROTO_ICMP) {
+        return XDP_PASS;
+    }
+
+    struct icmphdr* icmphdr = (void*)(iph + 1);
+    if ((void*)(icmphdr + 1) > data_end) {
+        return XDP_PASS;
+    }
+
+    if (icmphdr->type != 8) {
+        return XDP_PASS;
+    }
+
+    __u8 tmp_mac[ETH_ALEN];
+    bpf_memcpy(tmp_mac, eth->h_dest, ETH_ALEN);
+    bpf_memcpy(eth->h_dest, eth->h_source, ETH_ALEN);
+    bpf_memcpy(eth->h_source, tmp_mac, ETH_ALEN);
+
+    __u32 tmp_ip = iph->daddr;
+    iph->daddr = iph->saddr;
+    iph->saddr = tmp_ip;
+
+    icmphdr->type = 0;
+    recalc_icmp_csum(icmphdr, 8, icmphdr->type);
+
+    __u64* ts_secs = (void*)(icmphdr + 1);
+    __u64* ts_nsecs = (void*)(icmphdr + 1) + sizeof(__u64);
+
+    if ((void*)ts_nsecs + sizeof(__u64) <= data_end) {
+        __u64 old_secs = *ts_secs;
+        __u64 old_nsecs = *ts_nsecs;
+
+        *ts_secs -= bpf_get_prandom_u32() % 500;
+        *ts_nsecs -= bpf_get_prandom_u32();
+
+        recalc_icmp_csum(icmphdr, old_secs, *ts_secs);
+        recalc_icmp_csum(icmphdr, old_nsecs, *ts_nsecs);
+    }
+
+    __u8 old_ttl = iph->ttl;
+    iph->ttl = bpf_get_prandom_u32() % 200 + 40;
+    recalc_ip_csum(iph, old_ttl, iph->ttl);
+
+    __be16 old_seq = icmphdr->un.echo.sequence;
+    icmphdr->un.echo.sequence = bpf_htons(bpf_get_prandom_u32() % 1000);
+    recalc_icmp_csum(icmphdr, old_seq, icmphdr->un.echo.sequence);
+
+    return XDP_TX;
+}
+
+char LICENSE[] SEC("license") = "GPL";
+```
+</details>
+
+<br />
+
+### and that's how it looks like
+```bash
+$ ping 127.0.0.1
+PING 127.0.0.1 (127.0.0.1) 56(84) bytes of data.
+64 bytes from 127.0.0.1: icmp_seq=789 ttl=180 time=1257520 ms
+64 bytes from 127.0.0.1: icmp_seq=965 ttl=73 time=3875372 ms
+64 bytes from 127.0.0.1: icmp_seq=701 ttl=183 time=434820 ms
+64 bytes from 127.0.0.1: icmp_seq=689 ttl=95 time=771651 ms
+64 bytes from 127.0.0.1: icmp_seq=777 ttl=55 time=2024511 ms
+64 bytes from 127.0.0.1: icmp_seq=906 ttl=66 time=211697 ms
+64 bytes from 127.0.0.1: icmp_seq=674 ttl=163 time=2369164 ms
+```
+
+source code available at [github](https://github.com/x3lfyn/cursed-ping)
+
+try it yourself! - <Mono>ping pingme.x3lfy.space</Mono>

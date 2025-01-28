@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <title>{{ title }}</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <link rel="icon" href="/favicon.png">
+        <meta name="color-scheme" content="light dark" />
+        <meta property="og:type" content="profile">
+        <meta property="og:title" content="{{ title }}">
+        <meta property="og:image" content="https://gravatar.com/avatar/9dcc6fc1513be7249727613a0999b907?size=256">
+        <meta name="description" content="{{ description }}">
+
+        <link rel="stylesheet" href="/styles.css"/>
+        <script defer src="https://anal.over.rest/script.js" data-website-id="24ec91a8-4cda-4d93-a79f-f9330baa2fff"></script>
+    </head>
+    <body class="w-full m-0 bg-bg-0 text-fg-0 font-sans min-h-screen">
+        <header class="px-5 py-4 ml-auto mr-auto flex flex-col items-center bg-bg-hard">
+            <div class="relative max-w-full w-[60rem] flex justify-between">
+                <div>Alexey Novikov {{ comp.inlineMonospace({ content: "@x3lfyn" }) }}</div>
+                <div>
+                    {{ if isHomePage }}
+                    <span class="px-2 font-bold text-fg-currentPage">whoami</span>
+                    {{ else }}
+                    <a class="px-2 header-links" href="/">whoami</a>
+                    {{ /if }}
+                    {{ if isBlogPage }}
+                    <span class="px-2 font-bold text-fg-currentPage">blog</span>
+                    {{ else }}
+                    <a class="px-2 header-links" href="/blog">blog</a>
+                    {{ /if }}
+                </div>
+            </div>
+        </header>
+        <main class="px-4 py-1 ml-auto mr-auto flex flex-col items-center flex-1">
+            <div class="relative max-w-full w-[60rem]">
+                {{ content }}
+            </div>
+        </main>
+        {{ if showFooter }}
+        <footer class="px-4 py-4 ml-auto mr-auto flex flex-col items-center bg-bg-hard text-fg-dark text-s font-mono">
+            <div class="relative max-w-full w-[60rem]">
+                site built with <3 using <a href="https://lume.land">lume.land</a>. source code available <a href="https://github.com/x3lfyn/pfckws-ng">here</a>
+            </div>
+        </footer>
+        {{ endif }}
+    </body>
+</html>

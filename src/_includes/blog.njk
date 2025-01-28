@@ -1,0 +1,14 @@
+---
+layout: base.vto
+isBlogPage: true
+showFooter: true
+---
+
+<div class="font-serif">
+
+<h1>{{ title }}</h1>
+
+<div class="flex flex-row mb-4 text-fg-dark font-mono">published on {{ date | date("DATE") }}, {{ readingInfo.words }} words, {{ readingInfo.minutes }} mins to read</div>
+
+{{ content | safe }}
+</div>
