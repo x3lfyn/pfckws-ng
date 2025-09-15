@@ -7,15 +7,18 @@
     src: url(fonts/FantasqueSansMono-Bold.woff2);
     font-weight: bold;
 }
+
 @font-face {
     font-family: Fantasque;
     src: url(fonts/FantasqueSansMono-Regular.woff2);
 }
+
 @font-face {
     font-family: Fantasque;
     src: url(fonts/FantasqueSansMono-Italic.woff2);
     font-style: italic;
 }
+
 @font-face {
     font-family: Fantasque;
     src: url(fonts/FantasqueSansMono-BoldItalic.woff2);
@@ -28,13 +31,17 @@ html {
     -ms-overflow-style: none;
     scrollbar-width: none;
 }
+
 pre::-webkit-scrollbar,
 html::-webkit-scrollbar {
     display: none;
 }
 
-@import url("https://fonts.googleapis.com/css2?family=Roboto+Slab:wght@100..900&display=swap");
-@import url("https://fonts.googleapis.com/css2?family=Inter+Tight:ital,wght@0,100..900;1,100..900&display=swap");
+.font-serif {
+    font-optical-sizing: auto;
+    font-weight: 400;
+    font-style: normal;
+}
 
 .header-links {
     text-decoration: underline;
@@ -48,12 +55,15 @@ html::-webkit-scrollbar {
 :link {
     color: #ff8f40;
 }
+
 :visited {
     color: #e6b673;
 }
+
 a:hover {
     color: #ffb454;
 }
+
 a {
     text-decoration: underline;
 }
@@ -69,6 +79,11 @@ pre {
     border-radius: 20px;
     border: 2px dashed #ff8f40;
     overflow-x: scroll;
+}
+
+code *,
+pre * {
+    font-family: Fantasque;
 }
 
 img {

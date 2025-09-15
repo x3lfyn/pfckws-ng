@@ -15,13 +15,14 @@
         <link rel="preconnect" href="https://fonts.googleapis.com">
         <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
         <link href="https://fonts.googleapis.com/css2?family=Germania+One&display=swap" rel="stylesheet">
+        <link href="https://fonts.googleapis.com/css2?family=Roboto+Slab:wght@100..900&display=swap" rel="stylesheet">
 
         <script defer src="https://anal.over.rest/script.js" data-website-id="24ec91a8-4cda-4d93-a79f-f9330baa2fff"></script>
     </head>
-    <body class="w-full m-0 bg-bg-0 text-fg-0 font-sans min-h-screen">
-        <header class="px-5 py-4 ml-auto mr-auto flex flex-col items-center bg-bg-hard">
+    <body class="w-full m-0 bg-bg-0 text-fg-0 font-sans min-h-screen bg-bg-hard">
+        <header class="px-5 py-4 ml-auto mr-auto flex flex-col items-center">
             <div class="relative max-w-full w-[60rem] flex justify-between">
-                <div>Alexey Novikov {{ comp.inlineMonospace({ content: "@x3lfyn" }) }}</div>
+                <div>{{ if isHomePage }}Alexey Novikov&nbsp;{{ /if }}<a href="/">{{ comp.inlineMonospace({ content: "@x3lfyn" }) }}</a></div>
                 <div>
                     {{ if isHomePage }}
                     <span class="px-2 font-bold text-fg-currentPage">whoami</span>
@@ -36,13 +37,13 @@
                 </div>
             </div>
         </header>
-        <main class="px-4 py-1 ml-auto mr-auto flex flex-col items-center flex-1">
+        <main class="px-4 py-1 ml-auto mr-auto flex flex-col items-center flex-1 bg-bg-0">
             <div class="relative max-w-full w-[60rem]">
                 {{ content }}
             </div>
         </main>
         {{ if showFooter }}
-        <footer class="px-4 py-4 ml-auto mr-auto flex flex-col items-center bg-bg-hard text-fg-dark text-s font-mono">
+        <footer class="px-4 py-4 ml-auto mr-auto flex flex-col items-center text-fg-dark text-s font-mono">
             <div class="relative max-w-full w-[60rem]">
                 site built with <3 using <a href="https://lume.land">lume.land</a>. source code available <a href="https://github.com/x3lfyn/pfckws-ng">here</a>
             </div>

@@ -6,7 +6,7 @@ export const description = "yet another silly blog";
 export default ({ search }, {}) => (
   <div>
     <br />
-    {search.pages("post").map((post) => {
+    {search.pages("post").toReversed().map((post) => {
       return (
         <>
           <h4 className="my-1">
@@ -20,7 +20,7 @@ export default ({ search }, {}) => (
             })}{" "}
             | {post.readingInfo.minutes} minutes to read
           </div>
-          <p className="my-1">{post.description}</p>
+          <p className="my-1">{post.description}</p><br />
         </>
       );
     })}

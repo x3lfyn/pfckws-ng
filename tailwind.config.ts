@@ -1,4 +1,3 @@
-import forms from "npm:@tailwindcss/forms";
 import typography from "npm:@tailwindcss/typography";
 
 export default {

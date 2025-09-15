@@ -1,0 +1,149 @@
+---
+layout: blog.njk
+title: teaching nftables to add numbers (and other nifty things)
+date: 2025-09-13
+tags:
+  - notpost
+description: |
+    turns out, nft is capable of doing very interesting things. even on vanilla kernel
+---
+
+## what is nftables and why is it so powerful?
+
+nftables is a (relatively) new firewalling subsystem of linux kernel.
+it comes as a successor of \{ip,eb,arp\}tables system and introduces some new approaches to the linux firewall.
+
+the most interesting detail of its implementation is that nft rules are now built of some basic operations, just like in some virtual machine.
+these operations allow to fetch some information from packet, do some bitwise operations on it, compare data, use conntrack, apply NAT and many many other features important for a firewall.
+
+another major novelties of nft are sets and maps, which allow to match data against them, therefore reducing number of rules necessary for processing packets.
+there are even dynamic sets/maps which allow to add data to them in packet processing time.
+
+
+## how nft rules are constructed
+
+as i mentioned before, each rule in nft is constructed of some simple operations.
+you can make <Mono>nft</Mono> command show these instructions by adding <Mono>--debug netlink</Mono> option to it:
+```bash
+x3lfyn@ubuntu:~$ sudo nft --debug netlink list ruleset
+ip filter @__set0
+        element 00001600  : 0 [end]
+        element 00005000  : 0 [end]
+        element 0000bb01  : 0 [end]
+ip filter @__map0
+        element 00000004  : accept 0 [end]
+        element 00000001  : drop 0 [end]
+        element 00000002  : accept 0 [end]
+ip filter INPUT 5
+  [ meta load l4proto => reg 1 ]
+  [ cmp eq reg 1 0x00000006 ]
+  [ payload load 2b @ transport header + 2 => reg 1 ]
+  [ lookup reg 1 set __set0 0x0 ]
+  [ immediate reg 0 accept ]
+ip filter INPUT 7 5
+  [ ct load state => reg 1 ]
+  [ lookup reg 1 set __map0 dreg 0 0x0 ]
+ip filter INPUT 8 7
+  [ meta load iifname => reg 1 ]
+  [ cmp eq reg 1 0x00006f6c 0x00000000 0x00000000 0x00000000 ]
+  [ immediate reg 0 accept ]
+table ip filter {
+        chain INPUT {
+                type filter hook input priority filter; policy drop;
+                tcp dport { 22, 80, 443 } accept
+                ct state vmap { invalid : drop, established : accept, related : accept }
+                iifname "lo" accept
+        }
+}
+```
+
+as you can see, in each rule, some information from packet is loaded using <Mono>meta</Mono> or <Mono>payload</Mono> command and then it is being matched against map/set or compared with some constant.
+<Mono>__set0</Mono> and <Mono>__map0</Mono> are so-called [anonymous maps (sets)](https://wiki.nftables.org/wiki-nftables/index.php/Maps#Anonymous_maps).
+they are created automatically when you match something by list in rule
+lets explore each operation in this listing:
+- <Mono>meta</Mono> - loads some basic information about packet (like packet length, mark, interface name or even just random number).
+full list of available options (supported by kernel) is available [here](https://elixir.bootlin.com/linux/v6.16.4/source/include/uapi/linux/netfilter/nf_tables.h#L924)
+
+- <Mono>cmp</Mono> ([attrs](https://elixir.bootlin.com/linux/v6.16.4/source/include/uapi/linux/netfilter/nf_tables.h#L683)) - 
+compares with constant. has [6 basic comparison options](https://elixir.bootlin.com/linux/v6.16.4/source/include/uapi/linux/netfilter/nf_tables.h#L664)
+
+- <Mono>payload</Mono> ([attrs](https://elixir.bootlin.com/linux/v6.16.4/source/include/uapi/linux/netfilter/nf_tables.h#L851)) - loads some part of packet into a register.
+in this example it is used to get tcp port number from packet. this operation loads <Mono>NFTA_PAYLOAD_LEN</Mono> bytes with <Mono>NFTA_PAYLOAD_OFFSET</Mono> bytes off some base (<Mono>NFTA_PAYLOAD_BASE</Mono>).
+there are 5 bases available:
+  - <Mono>NFT_PAYLOAD_LL_HEADER</Mono> - link layer protocol header
+  - <Mono>NFT_PAYLOAD_NETWORK_HEADER</Mono> - network layer protocol header (IPv4, IPv6)
+  - <Mono>NFT_PAYLOAD_TRANSPORT_HEADER</Mono> - transport layer protocol header (TCP, UDP)
+  - <Mono>NFT_PAYLOAD_INNER_HEADER</Mono> - usually, actual payload containing L7 data
+  - <Mono>NFT_PAYLOAD_TUN_HEADER</Mono> - used for encapsulated traffic ig (i couldn't find examples of using it)
+
+  also, <Mono>payload</Mono> has also something to do with checksum checking and VLAN configuration, but i again couldn't found examples of it
+
+- <Mono>lookup</Mono> ([attrs](https://elixir.bootlin.com/linux/v6.16.4/source/include/uapi/linux/netfilter/nf_tables.h#L732)) - looks up an element in set or map. it works a bit different for sets and maps:
+  - for sets - it continues execution of rule only if set contains element from the source register
+  - for maps - it loads value corresponding to key from the source register to <Mono>dreg</Mono>
+
+- <Mono>immediate</Mono> - just loads some constant to a register. in this particular example it is used to <Mono>accept</Mono> traffic (we will explore this mechanism in a couple of paragraphs)
+
+- <Mono>ct</Mono> - load some information from [conntrack system](https://wiki.nftables.org/wiki-nftables/index.php/Connection_Tracking_System). quite similar to <Mono>meta</Mono> operation. list of available options is available [here](https://elixir.bootlin.com/linux/v6.16.4/source/include/uapi/linux/netfilter/nf_tables.h#L1126)
+
+of course these are not the only operations available, but i hope this gives some idea of how nft works. we will cover some other ops below
+
+
+## how rules are added to kernel
+
+*rlly need to write some words about netlink fuckery*
+
+
+## some very powerful features
+
+### <Mono>bitwise</Mono> operation
+*BITSHIFTS!!!*
+
+### dynamic maps
+*hooray, now we have more that 128 bytes of memory*
+
+
+## creating rules quite... unconventional way
+
+i've asked my friends about ways to configure nftables without using C libraries,
+like [nftnl](https://nftables.org/projects/libnftnl/index.html) (just because i rlly suck at C xd) and someone hinted me to use [google's go library](https://github.com/google/nftables).
+it wraps all low-level work with netlink and gives a quite convenient API to work with tables and chains, build expressions and some other stuff.
+but i wanted to have a handy DSL to write something like assembly code, but for nft.
+it is hard to build some DSL using go so i needed to choose some option
+
+one of my favourite languages is Kotlin. it has very cool syntax (imho!) and many other great features.
+but, most imporantly for this case, it is very good at DSLs.
+moreover, it has a scripting feature which allows to run scripts written in Kotlin without the need to separately compile script
+(it has lots of problems, and of course poor performance, because script is actually compiled using embedded compiler, but still it is very cool)
+
+but, obviously, there is no such convenient library for working with nftables for Kotlin. it is possible to use C libraries in Kotlin Native, but it is
+1) quite hard to use (you still need to deal with all very low-level stuff by youself without ergonomics of normal language)
+2) can only be used in native target, while scripting works only on JVM target
+
+sooo... i decided to get all the best things from two languages - i decided to generate go code with kotlin <InlineIcon src="/pictures/sticker.webp" alt="smiling emoji with bloody teeth" />
+
+### wrapping go structs with kotlin codegen
+*some text about Expressions sealed class and Codegenable interface*
+
+### trying to make kotlin scripting work
+*aaaa*
+
+### creating a DSL
+*uh oh kotlin builders goes brrrr*
+
+
+## now we can... try to add integers
+
+### attempt 1: basic RCA
+*oh no. we're out of operations*
+
+### attempt 2: ~Times~ Addition table
+*Alisa thought that it is a good idea and it is a good idea*
+
+
+## and i gave up :(
+
+when i just discovered that nft is a such powerful vm, i wanted to make something very very impressive.
+for example, make nft verify jwt tokens. and i still almost sure that it is possible
+(just a lot of branching to find a token in body of packet, two sha256 runs for hmac and base64. it is really that simple in case of HS256).
+i this experiment dragged on for six months and i no longer have motivation to finish it, so let it be at least something :D
